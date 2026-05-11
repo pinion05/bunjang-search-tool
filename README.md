@@ -3,7 +3,7 @@
 ## 상태
 
 현재 레포지토리는 **개념 설계 문서만** 포함한다.  
-초기 목표는 LangChain 에이전트가 호출할 수 있는 **번개장터 검색 전용 도구**의 구조를 먼저 고정하는 것이다.
+초기 목표는 LangChain 에이전트가 호출할 수 있는 **번개장터 검색 네이티브 도구**의 구조를 먼저 고정하는 것이다.
 
 ---
 
@@ -42,13 +42,13 @@
 
 ```text
 LangChain Agent
-  -> bunjang_search_tool(input)
-      -> 수집기(collector)
-      -> 사전 필터(prefilter)
-      -> 청크 생성기(chunker)
-      -> 청크별 LLM 평가기(scorer)
-      -> 결과 검증기(validator)
-      -> 병합기(reducer)
+  -> searchBunjangListingsForAgent(toolRequest)
+      -> collectBunjangListingsForEvaluation()
+      -> filterOutDeterministicNoiseListings()
+      -> buildListingEvaluationChunks()
+      -> scoreListingEvaluationChunk()
+      -> validateChunkSelectionResult()
+      -> reduceSelectedListingsAcrossChunks()
       -> 최종 후보 반환
 ```
 
@@ -65,28 +65,65 @@ LangChain Agent
 
 상위 LangChain 에이전트는 아래와 같은 단일 도구 인터페이스를 사용한다.
 
+이제 이 프로젝트는 CLI 플래그 인터페이스가 아니라 **LangChain 네이티브 구조화 도구**를 목표로 하므로, 필드 이름도 축약형보다 의도가 드러나는 이름을 우선 사용한다.
+
 ### 입력 초안
 
-- `query`: 검색어
-- `priceMin?`: 최소 가격
-- `priceMax?`: 최대 가격
-- `sort?`: `score | date | price_asc | price_desc`
-- `startPage?`: 시작 페이지
-- `pages?`: 수집 페이지 수
-- `maxItems?`: 최대 수집 개수
-- `topK?`: 최종 반환 후보 개수
-- `userIntent?`: 예: `실매물 위주`, `가성비 우선`, `미개봉 선호`
-- `excludeKeywords?`: 예: `교환`, `삽니다`, `케이스`
-- `debug?`: 디버그 산출물 저장 여부
+```ts
+type SearchBunjangListingsForAgentToolInput = {
+  searchQueryText: string;
+  minimumPriceKrw?: number;
+  maximumPriceKrw?: number;
+  searchSortOrder?: "score" | "date" | "price_asc" | "price_desc";
+  searchStartPageNumber?: number;
+  searchPageCount?: number;
+  maximumListingsToCollect?: number;
+  finalCandidateCount?: number;
+  rankingIntentDescription?: string;
+  excludedKeywordPhrases?: string[];
+  enableDebugArtifacts?: boolean;
+};
+```
+
+필드 의미:
+
+- `searchQueryText`: 사용자가 찾고 싶은 실제 검색어
+- `minimumPriceKrw` / `maximumPriceKrw`: 가격 범위 제한
+- `searchSortOrder`: 번개장터 검색 정렬 기준
+- `searchStartPageNumber`: 검색 시작 페이지
+- `searchPageCount`: 몇 페이지를 수집할지
+- `maximumListingsToCollect`: 전체 수집 상한
+- `finalCandidateCount`: 최종적으로 상위 몇 개를 돌려줄지
+- `rankingIntentDescription`: 예: `실매물 위주`, `가성비 우선`, `미개봉 선호`
+- `excludedKeywordPhrases`: 예: `교환`, `삽니다`, `케이스`
+- `enableDebugArtifacts`: 디버그용 청크/응답 저장 여부
 
 ### 출력 초안
 
-- `ids`: 최종 후보 ID 배열
-- `candidates`: 제목, 가격, URL, 점수, 근거를 포함한 요약 후보 목록
-- `stats`: 수집 개수, 청크 개수, LLM 호출 수, 병합 전 후보 수
-- `warnings?`: 일부 청크 실패 등 경고 정보
+```ts
+type SearchBunjangListingsForAgentToolResult = {
+  selectedListingIds: string[];
+  selectedListings: Array<{
+    listingId: string;
+    listingTitle: string;
+    listingPriceKrw: number | null;
+    listingUrl: string;
+    combinedRelevanceScore: number;
+    selectionReasonSummary: string;
+    riskFlagSummaries: string[];
+  }>;
+  pipelineExecutionStats: {
+    totalListingsCollected: number;
+    totalListingsAfterDeterministicFiltering: number;
+    totalEvaluationChunks: number;
+    totalLlmEvaluationCalls: number;
+    totalChunkLevelSelections: number;
+  };
+  pipelineWarnings?: string[];
+};
+```
 
-상위 에이전트는 보통 `ids`와 `candidates`만 사용해 최종 사용자 응답을 만든다.
+상위 에이전트는 보통 `selectedListingIds`와 `selectedListings`만 사용해 최종 사용자 응답을 만든다.
 
 ---
 
@@ -100,7 +137,7 @@ LangChain Agent
 
 - 검색 결과만 가져오지 않고 가능한 한 초기에 상세 본문까지 확보한다.
 - `with-detail` 수준의 데이터를 내부 평가 입력으로 사용한다.
-- 검색/상세 수집 실패는 가능한 한 개별 item 단위로 격리한다.
+- 검색/상세 수집 실패는 가능한 한 개별 listing 단위로 격리한다.
 
 ### 5.2 사전 필터
 
@@ -125,7 +162,7 @@ LLM 호출 전, 규칙 기반으로 노이즈를 먼저 제거한다.
 
 ### 5.3 청크 생성기
 
-수집된 item들을 평가 가능한 크기의 청크로 분할한다.
+수집된 listing들을 평가 가능한 크기의 청크로 분할한다.
 
 원칙:
 
@@ -136,7 +173,7 @@ LLM 호출 전, 규칙 기반으로 노이즈를 먼저 제거한다.
 초기 권장 방향:
 
 - 평가용 청크 목표 크기: 대략 12k~20k 토큰 수준
-- chunk당 여러 item을 포함하되, 응답 파싱 안정성을 우선한다.
+- 청크당 여러 listing을 포함하되, 응답 파싱 안정성을 우선한다.
 
 ### 5.4 청크별 LLM 평가기
 
@@ -145,13 +182,13 @@ LLM 호출 전, 규칙 기반으로 노이즈를 먼저 제거한다.
 평가기 역할:
 
 - 의미 있는 매물 ID만 선택
-- 각 후보에 점수 부여
-- 짧은 근거 제공
-- 위험 신호(flags) 기록
+- 각 후보에 `combinedRelevanceScore` 부여
+- 짧은 `selectionReasonSummary` 제공
+- `riskFlagSummaries` 기록
 
 평가기 제약:
 
-- 입력에 없는 ID를 생성하면 안 됨
+- 입력에 없는 `listingId`를 생성하면 안 됨
 - JSON만 출력해야 함
 - 추측 금지
 - 입력 텍스트 기반 근거만 사용
@@ -164,9 +201,9 @@ LLM 응답은 그대로 믿지 않고 검증한다.
 
 - JSON 파싱 성공 여부
 - 필수 필드 존재 여부
-- score 범위 정상 여부
-- 선택한 ID가 실제 청크 내부에 존재하는지
-- reason/flags 형식 이상 여부
+- `combinedRelevanceScore` 범위 정상 여부
+- 선택한 `listingId`가 실제 청크 내부에 존재하는지
+- `selectionReasonSummary` / `riskFlagSummaries` 형식 이상 여부
 
 실패 시 정책:
 
@@ -183,7 +220,7 @@ LLM 응답은 그대로 믿지 않고 검증한다.
 
 - ID 기준 dedupe
 - 점수 기준 정렬
-- topK 추출
+- `finalCandidateCount`만큼 추출
 - 필요 시 최소 점수 threshold 적용
 
 병합기의 책임:
@@ -199,12 +236,12 @@ LLM 응답은 그대로 믿지 않고 검증한다.
 
 ```json
 {
-  "selected": [
+  "selectedListings": [
     {
-      "id": "396049093",
-      "score": 0.91,
-      "reason": "본체 매물이며 설명이 구체적이고 액세서리/교환글이 아님",
-      "flags": ["배터리 상태 미기재"]
+      "listingId": "396049093",
+      "combinedRelevanceScore": 0.91,
+      "selectionReasonSummary": "본체 매물이며 설명이 구체적이고 액세서리/교환글이 아님",
+      "riskFlagSummaries": ["배터리 상태 미기재"]
     }
   ]
 }
@@ -240,22 +277,22 @@ LLM 응답은 그대로 믿지 않고 검증한다.
 ```text
 src/
   tools/
-    bunjang-search-tool.ts
+    search-bunjang-listings-for-agent-tool.ts
 
   bunjang/
-    collector.ts
-    prefilter.ts
-    chunker.ts
-    scorer.ts
-    validator.ts
-    reducer.ts
-    prompts.ts
-    schemas.ts
-    types.ts
+    collect-bunjang-listings-for-evaluation.ts
+    filter-out-deterministic-noise-listings.ts
+    build-listing-evaluation-chunks.ts
+    score-listing-evaluation-chunk.ts
+    validate-chunk-selection-result.ts
+    reduce-selected-listings-across-chunks.ts
+    bunjang-tool-prompts.ts
+    bunjang-tool-schemas.ts
+    bunjang-tool-types.ts
 
   llm/
-    client.ts
-    structured.ts
+    llm-client.ts
+    parse-structured-llm-output.ts
 ```
 
 설계 원칙:
@@ -268,13 +305,13 @@ src/
 
 ## 9. 초기 기본값 제안
 
-- `maxItems`: 100
-- `pages`: 10
-- `topK`: 5
-- `detailFetchConcurrency`: 5
-- `chunkTokenLimit`: 15000
-- `chunkSelectTopN`: 8
-- `llmConcurrency`: 4
+- `maximumListingsToCollect`: 100
+- `searchPageCount`: 10
+- `finalCandidateCount`: 5
+- `listingDetailFetchConcurrency`: 5
+- `listingEvaluationChunkTokenLimit`: 15000
+- `chunkLevelSelectionCount`: 8
+- `llmEvaluationConcurrency`: 4
 
 초기에는 100개 규모에서 안정성을 먼저 확인하고, 이후 200~300개로 확장한다.
 
@@ -303,7 +340,7 @@ src/
 
 ## 11. 현재 결론
 
-이 프로젝트는 **LangChain 에이전트가 호출하는 단일 번개장터 검색 도구**를 만드는 것을 목표로 하며, 내부적으로는 `bunjang-cli` 기반 수집과 구조화된 다회 LLM 평가 파이프라인을 가진다.
+이 프로젝트는 **LangChain 에이전트가 호출하는 단일 번개장터 검색 네이티브 도구**를 만드는 것을 목표로 하며, 내부적으로는 `bunjang-cli` 기반 수집과 구조화된 다회 LLM 평가 파이프라인을 가진다.
 
 핵심은 다음 세 가지다.
 
